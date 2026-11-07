@@ -15,7 +15,24 @@ from torch.utils.data import DataLoader, Subset
 
 from attrnet_ofdm.data import SavedOFDMDataset
 from attrnet_ofdm.model import AttRNet
-from train import mse
+
+
+@torch.no_grad()
+def mse_nmse(model: AttRNet, loader: DataLoader, device: torch.device) -> tuple[float, float]:
+    """Return complex-channel MSE and pooled energy-ratio NMSE."""
+    model.eval()
+    mse_total, error_energy, target_energy, count = 0.0, 0.0, 0.0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        error = (model(x) - y).square().sum(dim=1)
+        target = y.square().sum(dim=1)
+        mse_total += error.mean().item() * x.size(0)
+        error_energy += error.sum().item()
+        target_energy += target.sum().item()
+        count += x.size(0)
+    if count == 0:
+        raise ValueError("Cannot evaluate an empty dataset.")
+    return mse_total / count, error_energy / max(target_energy, 1e-30)
 
 
 def update_comparison_csv(path: Path, pilots: int, model_name: str, checkpoint: Path, values: dict[float, float]) -> None:
@@ -99,18 +116,20 @@ def main() -> None:
         p.error(f"Checkpoint expects {pilots} pilots but dataset manifest contains {dataset.pilots}.")
     model = AttRNet(checkpoint["model"], checkpoint["features"], output_kernel=tuple(checkpoint["output_kernel"])).to(device)
     model.load_state_dict(checkpoint["state_dict"])
-    total = mse(model, DataLoader(dataset, batch_size=args.batch_size), device)
+    total_mse, total_nmse = mse_nmse(model, DataLoader(dataset, batch_size=args.batch_size), device)
     print(f"checkpoint: {args.checkpoint}")
     print(f"data: {data_dir} ({args.split}, {len(dataset):,} samples)")
-    print(f"overall_mse: {total:.8g}")
-    print("snr_db,mse,samples")
+    print(f"overall_mse: {total_mse:.8g}")
+    print(f"overall_nmse: {total_nmse:.8g}")
+    print(f"overall_nmse_db: {10 * np.log10(max(total_nmse, 1e-30)):.6g}")
+    print("snr_db,mse,nmse,nmse_db,samples")
     snrs = np.asarray(dataset.snr_db)
     per_snr: dict[float, float] = {}
     for snr in np.unique(snrs):
         indices = np.flatnonzero(snrs == snr).tolist()
-        value = mse(model, DataLoader(Subset(dataset, indices), batch_size=args.batch_size), device)
+        value, nmse = mse_nmse(model, DataLoader(Subset(dataset, indices), batch_size=args.batch_size), device)
         per_snr[float(snr)] = value
-        print(f"{snr:g},{value:.8g},{len(indices)}")
+        print(f"{snr:g},{value:.8g},{nmse:.8g},{10 * np.log10(max(nmse, 1e-30)):.6g},{len(indices)}")
     if args.comparison_csv is not None:
         display_name = {"fc": "AttRNet-FC", "conv": "AttRNet-Conv"}[checkpoint["model"]]
         update_comparison_csv(args.comparison_csv, pilots, display_name, args.checkpoint, per_snr)
